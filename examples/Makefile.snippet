@@ -1,0 +1,14 @@
+# Copyright (c) 2026 Defend I.T. Solutions. MIT License.
+# dis-sign integration — drop into your project's Makefile
+
+.PHONY: sign verify dis-sign-update
+
+sign:
+	@vendor/dis-sign/bin/dis-sign
+
+verify:
+	@vendor/dis-sign/bin/dis-verify
+
+dis-sign-update:
+	git subtree pull --prefix vendor/dis-sign \
+	  https://github.com/wedefendit/dis-sign main --squash

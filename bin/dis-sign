@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Defend I.T. Solutions
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# dis-sign — generate a content-addressed manifest for a project and
+# detached-sign it with GPG.
+#
+# Dev-box only. Never runs in CI. Never runs on production hosts.
+#
+# Usage:
+#   dis-sign [--config PATH] [--repo PATH] [--out PATH]
+#
+# Defaults:
+#   --config  ./dis-sign.conf
+#   --repo    parent directory of --config (or $PWD if no --config)
+#   --out     <repo>/signing/<APP_NAME>-manifest.json
+#
+# Environment overrides:
+#   DIS_SIGN_CONFIG    same as --config
+#   DIS_SIGN_GPG_HOME  GPG home directory (overrides config GPG_HOME)
+#
+# Config file format (parsed as a constrained config format):
+#   APP_NAME=myapp
+#   SIGNING_KEY=<full GPG key fingerprint>
+#   GPG_HOME=~/.gnupg-project             # optional; ~ is expanded
+#   CATEGORIES=(                          # optional
+#     "category-name:glob [glob ...]"
+#     ...
+#   )
+#   IGNORE=(                              # optional
+#     "glob" "glob" ...                   # bash globs, globstar enabled
+#   )
+#
+# GPG home precedence: env DIS_SIGN_GPG_HOME > config GPG_HOME > ~/.gnupg.
+#
+# If CATEGORIES is unset or empty, dis-sign falls back to git ls-files
+# and puts every tracked file under a single "all" category.
+#
+# IGNORE globs are expanded as repo-relative path globs after file
+# selection in both modes. Any matching file is dropped before hashing.
+# Useful for excluding test fixtures, vendored subtrees, or generated
+# output from the manifest.
+#
+# See docs/spec.md for the manifest format.
+
+set -Eeuo pipefail
+shopt -s nullglob globstar
+
+VERSION="0.1.2"
+
+usage() {
+  cat <<EOF
+dis-sign ${VERSION} — content-addressed signed manifest generator
+
+usage: $(basename "$0") [--config PATH] [--repo PATH] [--out PATH] [--help]
+
+  --config PATH   path to dis-sign.conf (default: ./dis-sign.conf)
+  --repo PATH     repo root to operate from (default: dirname of config)
+  --out PATH      output manifest path (default: <repo>/signing/<APP_NAME>-manifest.json)
+  --help          show this message
+
+env:
+  DIS_SIGN_CONFIG     same as --config
+  DIS_SIGN_GPG_HOME   GPG home directory (default: ~/.gnupg)
+EOF
+}
+
+CONFIG="${DIS_SIGN_CONFIG:-}"
+REPO=""
+OUT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config) CONFIG="$2"; shift 2 ;;
+    --repo)   REPO="$2";   shift 2 ;;
+    --out)    OUT="$2";    shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    --version) echo "dis-sign ${VERSION}"; exit 0 ;;
+    *) echo "dis-sign: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+CONFIG="${CONFIG:-./dis-sign.conf}"
+
+[[ -r "$CONFIG" ]] || {
+  echo "dis-sign: config not found: $CONFIG" >&2
+  exit 1
+}
+
+CONFIG_ABS=$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")
+REPO="${REPO:-$(dirname "$CONFIG_ABS")}"
+cd "$REPO"
+
+die() {
+  echo "dis-sign: $*" >&2
+  exit 1
+}
+
+CONFIG_LINE_NO=0
+config_error() {
+  echo "dis-sign: $CONFIG:${CONFIG_LINE_NO}: $*" >&2
+  exit 1
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+strip_comment() {
+  local s="$1"
+  local out=""
+  local quote=""
+  local ch
+  local i
+
+  for ((i = 0; i < ${#s}; i++)); do
+    ch="${s:i:1}"
+    if [[ -n "$quote" ]]; then
+      out+="$ch"
+      [[ "$ch" == "$quote" ]] && quote=""
+      continue
+    fi
+    case "$ch" in
+      \"|\') quote="$ch"; out+="$ch" ;;
+      '#') break ;;
+      *) out+="$ch" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+parse_scalar_value() {
+  local var="$1"
+  local raw
+  local quote
+  local value=""
+  local rest=""
+  local ch
+  local found=0
+  local i
+
+  raw=$(trim "$(strip_comment "$2")")
+  [[ -n "$raw" ]] || config_error "$var cannot be empty"
+
+  case "${raw:0:1}" in
+    \"|\')
+      quote="${raw:0:1}"
+      for ((i = 1; i < ${#raw}; i++)); do
+        ch="${raw:i:1}"
+        if [[ "$ch" == "$quote" ]]; then
+          rest="${raw:i+1}"
+          found=1
+          break
+        fi
+        value+="$ch"
+      done
+      [[ $found -eq 1 ]] || config_error "unterminated quoted value for $var"
+      rest=$(trim "$rest")
+      [[ -z "$rest" ]] || config_error "unexpected text after $var value"
+      ;;
+    *)
+      [[ "$raw" != *[[:space:]\(\)]* ]] || config_error "$var must be a single value"
+      value="$raw"
+      ;;
+  esac
+
+  printf -v "$var" '%s' "$value"
+}
+
+append_config_array_value() {
+  local var="$1"
+  local value="$2"
+
+  case "$var" in
+    CATEGORIES) CATEGORIES+=("$value") ;;
+    IGNORE) IGNORE+=("$value") ;;
+    *) config_error "internal parser error for array: $var" ;;
+  esac
+}
+
+CONFIG_ARRAY_CLOSED=0
+parse_array_fragment() {
+  local var="$1"
+  local fragment
+  local quote
+  local token
+  local rest
+  local ch
+  local found
+  local i
+
+  CONFIG_ARRAY_CLOSED=0
+  fragment=$(trim "$(strip_comment "$2")")
+
+  while [[ -n "$fragment" ]]; do
+    case "${fragment:0:1}" in
+      ")")
+        CONFIG_ARRAY_CLOSED=1
+        fragment=$(trim "${fragment:1}")
+        [[ -z "$fragment" ]] || config_error "unexpected text after $var array close"
+        break
+        ;;
+      \"|\')
+        quote="${fragment:0:1}"
+        token=""
+        rest=""
+        found=0
+        for ((i = 1; i < ${#fragment}; i++)); do
+          ch="${fragment:i:1}"
+          if [[ "$ch" == "$quote" ]]; then
+            rest="${fragment:i+1}"
+            found=1
+            break
+          fi
+          token+="$ch"
+        done
+        [[ $found -eq 1 ]] || config_error "unterminated quoted value in $var"
+        append_config_array_value "$var" "$token"
+        fragment=$(trim "$rest")
+        ;;
+      *)
+        token=""
+        rest=""
+        for ((i = 0; i < ${#fragment}; i++)); do
+          ch="${fragment:i:1}"
+          if [[ "$ch" == ")" || "$ch" =~ [[:space:]] ]]; then
+            token="${fragment:0:i}"
+            rest="${fragment:i}"
+            break
+          fi
+        done
+        if [[ -z "$token" ]]; then
+          token="$fragment"
+          rest=""
+        fi
+        [[ -n "$token" ]] || config_error "empty value in $var"
+        append_config_array_value "$var" "$token"
+        fragment=$(trim "$rest")
+        ;;
+    esac
+  done
+}
+
+parse_config_array() {
+  local var="$1"
+  local raw
+
+  raw=$(trim "$(strip_comment "$2")")
+  [[ "${raw:0:1}" == "(" ]] || config_error "$var must be an array"
+  case "$var" in
+    CATEGORIES) CATEGORIES=() ;;
+    IGNORE) IGNORE=() ;;
+    *) config_error "internal parser error for array: $var" ;;
+  esac
+  parse_array_fragment "$var" "${raw:1}"
+}
+
+parse_config() {
+  local path="$1"
+  local line
+  local stripped
+  local current_array=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    CONFIG_LINE_NO=$((CONFIG_LINE_NO + 1))
+    stripped=$(trim "$(strip_comment "$line")")
+    [[ -z "$stripped" ]] && continue
+
+    if [[ -n "$current_array" ]]; then
+      parse_array_fragment "$current_array" "$stripped"
+      [[ $CONFIG_ARRAY_CLOSED -eq 1 ]] && current_array=""
+      continue
+    fi
+
+    case "$stripped" in
+      APP_NAME=*) parse_scalar_value APP_NAME "${stripped#APP_NAME=}" ;;
+      SIGNING_KEY=*) parse_scalar_value SIGNING_KEY "${stripped#SIGNING_KEY=}" ;;
+      GPG_HOME=*) parse_scalar_value GPG_HOME "${stripped#GPG_HOME=}" ;;
+      CATEGORIES=*)
+        parse_config_array CATEGORIES "${stripped#CATEGORIES=}"
+        [[ $CONFIG_ARRAY_CLOSED -eq 0 ]] && current_array="CATEGORIES"
+        ;;
+      IGNORE=*)
+        parse_config_array IGNORE "${stripped#IGNORE=}"
+        [[ $CONFIG_ARRAY_CLOSED -eq 0 ]] && current_array="IGNORE"
+        ;;
+      *) config_error "unsupported config syntax" ;;
+    esac
+  done < "$path"
+
+  [[ -z "$current_array" ]] || config_error "unterminated $current_array array"
+}
+
+CATEGORIES=()
+IGNORE=()
+APP_NAME=""
+SIGNING_KEY=""
+GPG_HOME=""
+parse_config "$CONFIG_ABS"
+
+[[ -n "$APP_NAME" ]] || die "$CONFIG missing APP_NAME"
+[[ "$APP_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "APP_NAME must contain only letters, numbers, dot, underscore, and dash"
+[[ -n "$SIGNING_KEY" ]] || die "$CONFIG missing SIGNING_KEY"
+[[ "$SIGNING_KEY" =~ ^[[:xdigit:]]{40,64}$ ]] || die "SIGNING_KEY must be a full hex fingerprint"
+
+OUT="${OUT:-signing/${APP_NAME}-manifest.json}"
+SIG="${OUT}.asc"
+GPG_HOME="${DIS_SIGN_GPG_HOME:-${GPG_HOME:-$HOME/.gnupg}}"
+GPG_HOME="${GPG_HOME/#\~/$HOME}"
+
+for bin in jq sha256sum gpg sort awk; do
+  command -v "$bin" >/dev/null || {
+    echo "dis-sign: missing dependency: $bin" >&2
+    exit 1
+  }
+done
+
+if [[ ! -d "$GPG_HOME" ]]; then
+  echo "dis-sign: GPG home not found: $GPG_HOME" >&2
+  echo "set DIS_SIGN_GPG_HOME=/path/to/gnupg-homedir if your key lives elsewhere" >&2
+  exit 1
+fi
+
+normalize_repo_path() {
+  local path="$1"
+  local repo_abs
+  repo_abs=$(pwd -P)
+
+  if [[ "$path" == "$repo_abs"/* ]]; then
+    path="${path#"$repo_abs"/}"
+  fi
+  while [[ "$path" == ./* ]]; do
+    path="${path#./}"
+  done
+  printf '%s\n' "$path"
+}
+
+validate_repo_relative_path() {
+  local path="$1"
+  local label="$2"
+
+  if [[ -z "$path" || "$path" == /* || "$path" == ".." || "$path" == ../* || "$path" == *"/../"* || "$path" == */.. ]]; then
+    die "$label must stay inside the repo: $path"
+  fi
+}
+
+validate_repo_relative_glob() {
+  local pattern="$1"
+  local label="$2"
+
+  validate_repo_relative_path "$pattern" "$label glob"
+}
+
+artifacts='{}'
+count=0
+declare -A seen_paths=()
+declare -A ignored_paths=()
+
+OUT_REPO=$(normalize_repo_path "$OUT")
+SIG_REPO=$(normalize_repo_path "$SIG")
+validate_repo_relative_path "$OUT_REPO" "--out"
+validate_repo_relative_path "$SIG_REPO" "--out signature"
+mkdir -p "$(dirname "$OUT")"
+
+build_ignored_paths() {
+  local pattern
+  local match
+  local manifest_path
+
+  for pattern in "${IGNORE[@]}"; do
+    [[ -z "$pattern" ]] && continue
+    validate_repo_relative_glob "$pattern" "IGNORE"
+    for match in $pattern; do
+      [[ -f "$match" ]] || continue
+      manifest_path=$(normalize_repo_path "$match")
+      validate_repo_relative_path "$manifest_path" "IGNORE match"
+      ignored_paths["$manifest_path"]=1
+    done
+  done
+}
+
+is_ignored() {
+  local f="$1"
+  [[ -n "${ignored_paths[$f]:-}" ]]
+}
+
+build_ignored_paths
+
+if [[ ${#CATEGORIES[@]} -gt 0 ]]; then
+  # Explicit categories from config
+  for entry in "${CATEGORIES[@]}"; do
+    category="${entry%%:*}"
+    globs="${entry#*:}"
+    category_globs=()
+    if [[ -z "$category" || "$category" == "$entry" ]]; then
+      echo "dis-sign: malformed CATEGORIES entry: $entry" >&2
+      exit 1
+    fi
+    [[ "$category" =~ ^[A-Za-z0-9._-]+$ ]] || die "category names must contain only letters, numbers, dot, underscore, and dash: $category"
+    read -r -a category_globs <<< "$globs"
+
+    matches=()
+    for pattern in "${category_globs[@]}"; do
+      validate_repo_relative_glob "$pattern" "CATEGORIES"
+      for match in $pattern; do
+        [[ -f "$match" ]] && matches+=("$match")
+      done
+    done
+    [[ ${#matches[@]} -eq 0 ]] && continue
+
+    sorted=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -u)
+    cat_obj='{}'
+    cat_count=0
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      manifest_path=$(normalize_repo_path "$f")
+      [[ "$manifest_path" == "$OUT_REPO" || "$manifest_path" == "$SIG_REPO" ]] && continue
+      is_ignored "$manifest_path" && continue
+      if [[ -n "${seen_paths[$manifest_path]:-}" ]]; then
+        echo "dis-sign: file appears in multiple categories: $manifest_path" >&2
+        echo "  first category: ${seen_paths[$manifest_path]}" >&2
+        echo "  second category: $category" >&2
+        exit 1
+      fi
+      seen_paths["$manifest_path"]="$category"
+      hash=$(sha256sum "$f" | awk '{print $1}')
+      cat_obj=$(jq --arg f "$manifest_path" --arg h "sha256:$hash" '. + {($f): $h}' <<<"$cat_obj")
+      count=$((count + 1))
+      cat_count=$((cat_count + 1))
+    done <<<"$sorted"
+    [[ $cat_count -eq 0 ]] && continue
+    artifacts=$(jq --arg c "$category" --argjson v "$cat_obj" '. + {($c): $v}' <<<"$artifacts")
+  done
+else
+  # No categories — fall back to git ls-files
+  command -v git >/dev/null || {
+    echo "dis-sign: no CATEGORIES and git not found" >&2
+    exit 1
+  }
+  git rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "dis-sign: no CATEGORIES and not in a git repo" >&2
+    exit 1
+  }
+
+  cat_obj='{}'
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+    manifest_path=$(normalize_repo_path "$f")
+    [[ "$manifest_path" == "$OUT_REPO" || "$manifest_path" == "$SIG_REPO" ]] && continue
+    is_ignored "$manifest_path" && continue
+    hash=$(sha256sum "$f" | awk '{print $1}')
+    cat_obj=$(jq --arg f "$manifest_path" --arg h "sha256:$hash" '. + {($f): $h}' <<<"$cat_obj")
+    count=$((count + 1))
+  done < <(git ls-files | LC_ALL=C sort)
+  artifacts=$(jq --argjson v "$cat_obj" '. + {"all": $v}' <<<"$artifacts")
+fi
+
+if [[ $count -eq 0 ]]; then
+  die "refusing to sign an empty manifest; check CATEGORIES and IGNORE"
+fi
+
+timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+manifest=$(jq -n \
+  --arg app "$APP_NAME" \
+  --arg generated_at "$timestamp" \
+  --arg fpr "$SIGNING_KEY" \
+  --arg tool "dis-sign/$VERSION" \
+  --argjson artifacts "$artifacts" \
+  --argjson count "$count" \
+  '{
+    version: 1,
+    tool: $tool,
+    app: $app,
+    generated_at: $generated_at,
+    signing_key_fingerprint: $fpr,
+    artifacts: $artifacts,
+    artifact_count: $count,
+    manifest_hash: ""
+  }')
+
+self_hash=$(jq -S . <<<"$manifest" | sha256sum | awk '{print $1}')
+manifest=$(jq --arg h "sha256:$self_hash" '.manifest_hash = $h' <<<"$manifest")
+
+tmp=$(mktemp "${OUT}.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+jq -S . <<<"$manifest" > "$tmp"
+mv "$tmp" "$OUT"
+trap - EXIT
+
+gpg --homedir "$GPG_HOME" \
+    --local-user "$SIGNING_KEY" \
+    --detach-sign --armor --yes \
+    --output "$SIG" \
+    "$OUT"
+
+echo "dis-sign: wrote $OUT ($count files, manifest_hash sha256:$self_hash)"
+echo "dis-sign: wrote $SIG"

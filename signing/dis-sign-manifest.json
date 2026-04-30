@@ -1,0 +1,34 @@
+{
+  "app": "dis-sign",
+  "artifact_count": 11,
+  "artifacts": {
+    "assets": {
+      "assets/dis-sign.png": "sha256:a74eda53226c2f667a42dba89cb1b8634bf21b20d708651b78f9f952653aba7c"
+    },
+    "bin": {
+      "bin/dis-sign": "sha256:82580916ba25545d95fc219e8a0712a9012c91ba20b0490a86d4e97ee45d3d78",
+      "bin/dis-verify": "sha256:ef15decd61ea019e957e30d7f6db908c90c5e69fb9cd25ad7d781aa0eb05cc45"
+    },
+    "docs": {
+      "docs/spec.md": "sha256:619f05a426a4c54477b82baf8646ef8fc2aa38aef82b6063c90962d3fdc02fd4"
+    },
+    "examples": {
+      "examples/Makefile.snippet": "sha256:e7430979511111f7c75705671c8cb58877c0f85ddb199041cf5b9ada51014914",
+      "examples/dis-sign.conf": "sha256:86ddf55e86dfc857f725011e8180366c1f7e37dbc1f9a35b6c9aad531be13dec"
+    },
+    "root": {
+      ".gitignore": "sha256:480e1217dd10eee356be999f217cc937474700ec7741f8bbc3eb5ad650b2204a",
+      "LICENSE": "sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "README.md": "sha256:b28184507cc2646b3937db0c08e4253f3929990b68039348f7a4bc8da6a2e4a1",
+      "dis-sign.conf": "sha256:4dea823072c055733f5a9b3101ba2e55b146b5c1e73bffe42936e5f0589796ef"
+    },
+    "test": {
+      "test/roundtrip.sh": "sha256:3507bc07cc500f4b1f770e0b867b492c43213f07bc95b4d1062fcb9f6f52b24a"
+    }
+  },
+  "generated_at": "2026-04-30T17:11:10Z",
+  "manifest_hash": "sha256:9aa29785ffc358ebc97673f7d4e52fd0d48d9485b71de7082b082028cdb41a2c",
+  "signing_key_fingerprint": "2C4259D83B8EC4BBBA6CDCF067528B17E4558404",
+  "tool": "dis-sign/0.1.2",
+  "version": 1
+}

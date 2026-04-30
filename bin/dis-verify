@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Defend I.T. Solutions
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# dis-verify — verify a signed manifest against a repo on disk.
+#
+# Usage:
+#   dis-verify [--manifest PATH] [--sig PATH] [--repo PATH] [--keyring PATH] [--trusted-fingerprint FPR]
+#
+# Defaults:
+#   --manifest  ./signing/<name>-manifest.json (auto-detected, single match)
+#   --sig       <manifest>.asc
+#   --repo      directory containing signing/
+#   --keyring   <repo>/signing/*.gpg.asc (auto-detected) OR ~/.gnupg
+#
+# Environment overrides:
+#   DIS_VERIFY_TRUSTED_FINGERPRINT  require this signer fingerprint
+#
+# Exit codes:
+#   0  manifest signature valid AND every artifact hash matches
+#   1  signature invalid OR key not trusted
+#   2  signature valid but one or more artifacts missing or modified
+#   3  usage / config / dependency error
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<EOF
+dis-verify ${VERSION} — verify a dis-sign manifest
+
+usage: $(basename "$0") [--manifest PATH] [--sig PATH] [--repo PATH] [--keyring PATH] [--trusted-fingerprint FPR] [--help]
+
+  --manifest PATH   manifest .json (default: auto-detect single signing/*-manifest.json)
+  --sig PATH        signature .asc (default: <manifest>.asc)
+  --repo PATH       repo root (default: parent of signing/)
+  --keyring PATH    public keyring file (default: signing/*.gpg.asc, else ~/.gnupg)
+  --trusted-fingerprint FPR
+                    require manifest and signature signer to match this fingerprint
+  --help            show this message
+
+env:
+  DIS_VERIFY_TRUSTED_FINGERPRINT  same as --trusted-fingerprint
+
+exit:
+  0  signature OK and all artifacts match
+  1  signature invalid
+  2  signature OK but artifacts modified or missing
+  3  usage / dependency error
+EOF
+}
+
+MANIFEST=""
+SIG=""
+REPO=""
+KEYRING=""
+TRUSTED_FINGERPRINT="${DIS_VERIFY_TRUSTED_FINGERPRINT:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --manifest)            MANIFEST="$2";            shift 2 ;;
+    --sig)                 SIG="$2";                 shift 2 ;;
+    --repo)                REPO="$2";                shift 2 ;;
+    --keyring)             KEYRING="$2";             shift 2 ;;
+    --trusted-fingerprint) TRUSTED_FINGERPRINT="$2"; shift 2 ;;
+    --help|-h)             usage; exit 0 ;;
+    --version)             echo "dis-verify ${VERSION}"; exit 0 ;;
+    *) echo "dis-verify: unknown argument: $1" >&2; usage >&2; exit 3 ;;
+  esac
+done
+
+for bin in jq sha256sum gpg awk; do
+  command -v "$bin" >/dev/null || {
+    echo "dis-verify: missing dependency: $bin" >&2
+    exit 3
+  }
+done
+
+normalize_fingerprint() {
+  local fpr="$1"
+  fpr="${fpr//[[:space:]]/}"
+  printf '%s\n' "${fpr^^}"
+}
+
+abs_file_path() {
+  local path="$1"
+  local dir
+  local base
+  dir=$(dirname "$path")
+  base=$(basename "$path")
+  if ! dir=$(cd "$dir" 2>/dev/null && pwd); then
+    echo "dis-verify: path parent not found: $path" >&2
+    exit 3
+  fi
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+abs_dir_path() {
+  local path="$1"
+  local original="$path"
+  if ! path=$(cd "$path" 2>/dev/null && pwd); then
+    echo "dis-verify: repo not found: $original" >&2
+    exit 3
+  fi
+  printf '%s\n' "$path"
+}
+
+[[ -n "$MANIFEST" ]] && MANIFEST=$(abs_file_path "$MANIFEST")
+[[ -n "$SIG" ]] && SIG=$(abs_file_path "$SIG")
+[[ -n "$KEYRING" ]] && KEYRING=$(abs_file_path "$KEYRING")
+TRUSTED_FINGERPRINT=$(normalize_fingerprint "$TRUSTED_FINGERPRINT")
+
+# Auto-detect repo from current dir if not given
+if [[ -z "$REPO" ]]; then
+  if [[ -n "$MANIFEST" ]]; then
+    REPO=$(cd "$(dirname "$MANIFEST")/.." && pwd)
+  else
+    REPO=$(pwd)
+  fi
+else
+  REPO=$(abs_dir_path "$REPO")
+fi
+cd "$REPO"
+
+# Auto-detect manifest if not given
+if [[ -z "$MANIFEST" ]]; then
+  candidates=(signing/*-manifest.json)
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    echo "dis-verify: no signing/*-manifest.json found in $REPO" >&2
+    exit 3
+  fi
+  if [[ ${#candidates[@]} -gt 1 ]]; then
+    echo "dis-verify: multiple manifests found, specify --manifest:" >&2
+    printf '  %s\n' "${candidates[@]}" >&2
+    exit 3
+  fi
+  MANIFEST="${candidates[0]}"
+fi
+
+[[ -r "$MANIFEST" ]] || {
+  echo "dis-verify: manifest not readable: $MANIFEST" >&2
+  exit 3
+}
+
+SIG="${SIG:-${MANIFEST}.asc}"
+[[ -r "$SIG" ]] || {
+  echo "dis-verify: signature not readable: $SIG" >&2
+  exit 3
+}
+
+# Auto-detect keyring
+GPG_TMPDIR=""
+VERIFY_STATUS=""
+cleanup() {
+  [[ -n "$GPG_TMPDIR" ]] && rm -rf "$GPG_TMPDIR"
+  [[ -n "$VERIFY_STATUS" ]] && rm -f "$VERIFY_STATUS"
+}
+trap cleanup EXIT
+
+if [[ -z "$KEYRING" ]]; then
+  pubkeys=(signing/*.gpg.asc signing/*.pub signing/*.asc)
+  # filter out the signature itself
+  filtered=()
+  for k in "${pubkeys[@]}"; do
+    [[ "$k" == "$SIG" ]] && continue
+    [[ "$SIG" == /* && "$(pwd -P)/$k" == "$SIG" ]] && continue
+    [[ "$k" == *-manifest.json.asc ]] && continue
+    filtered+=("$k")
+  done
+  if [[ ${#filtered[@]} -gt 0 ]]; then
+    KEYRING="${filtered[0]}"
+  fi
+fi
+
+GPG_ARGS=()
+if [[ -n "$KEYRING" && ! -r "$KEYRING" ]]; then
+  echo "dis-verify: keyring not readable: $KEYRING" >&2
+  exit 3
+fi
+if [[ -n "$KEYRING" ]]; then
+  GPG_TMPDIR=$(mktemp -d)
+  chmod 700 "$GPG_TMPDIR"
+  gpg --homedir "$GPG_TMPDIR" --import "$KEYRING" >/dev/null 2>&1 || {
+    echo "dis-verify: failed to import keyring: $KEYRING" >&2
+    exit 1
+  }
+  GPG_ARGS=(--homedir "$GPG_TMPDIR")
+fi
+
+# Verify signature
+VERIFY_STATUS=$(mktemp)
+if ! gpg "${GPG_ARGS[@]}" --batch --status-fd 1 --verify "$SIG" "$MANIFEST" >"$VERIFY_STATUS" 2>/dev/null; then
+  echo "dis-verify: SIGNATURE INVALID for $MANIFEST"
+  exit 1
+fi
+echo "dis-verify: signature OK ($MANIFEST)"
+
+signer_fpr=$(awk '/^\[GNUPG:\] VALIDSIG / {print $3; exit}' "$VERIFY_STATUS")
+signer_fpr=$(normalize_fingerprint "$signer_fpr")
+manifest_fpr=$(jq -r '.signing_key_fingerprint // empty' "$MANIFEST")
+manifest_fpr=$(normalize_fingerprint "$manifest_fpr")
+
+if [[ -z "$signer_fpr" ]]; then
+  echo "dis-verify: could not determine signature signer fingerprint"
+  exit 1
+fi
+if [[ -z "$manifest_fpr" ]]; then
+  echo "dis-verify: manifest missing signing_key_fingerprint"
+  exit 1
+fi
+if [[ "$signer_fpr" != "$manifest_fpr" ]]; then
+  echo "dis-verify: signer fingerprint mismatch"
+  echo "  manifest: $manifest_fpr"
+  echo "  signer:   $signer_fpr"
+  exit 1
+fi
+if [[ -n "$TRUSTED_FINGERPRINT" && "$manifest_fpr" != "$TRUSTED_FINGERPRINT" ]]; then
+  echo "dis-verify: trusted fingerprint mismatch"
+  echo "  trusted:  $TRUSTED_FINGERPRINT"
+  echo "  manifest: $manifest_fpr"
+  echo "  signer:   $signer_fpr"
+  exit 1
+fi
+echo "dis-verify: signer fingerprint OK ($signer_fpr)"
+
+# Verify the manifest's self-hash
+declared=$(jq -r '.manifest_hash' "$MANIFEST")
+recomputed=$(jq -S 'del(.manifest_hash) + {manifest_hash: ""}' "$MANIFEST" \
+  | sha256sum | awk '{print $1}')
+if [[ "$declared" != "sha256:$recomputed" ]]; then
+  echo "dis-verify: manifest_hash mismatch"
+  echo "  declared:   $declared"
+  echo "  recomputed: sha256:$recomputed"
+  exit 2
+fi
+echo "dis-verify: manifest_hash OK"
+
+# Verify each artifact
+fail=0
+total=0
+while IFS=$'\t' read -r path expected; do
+  total=$((total + 1))
+  if [[ ! -f "$path" ]]; then
+    echo "  MISSING  $path"
+    fail=$((fail + 1))
+    continue
+  fi
+  actual="sha256:$(sha256sum "$path" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "  MODIFIED $path"
+    echo "    expected: $expected"
+    echo "    actual:   $actual"
+    fail=$((fail + 1))
+  fi
+done < <(jq -r '.artifacts | to_entries[] | .value | to_entries[] | "\(.key)\t\(.value)"' "$MANIFEST")
+
+if [[ $fail -gt 0 ]]; then
+  echo "dis-verify: FAIL — $fail of $total artifacts bad"
+  exit 2
+fi
+echo "dis-verify: all $total artifacts OK"
